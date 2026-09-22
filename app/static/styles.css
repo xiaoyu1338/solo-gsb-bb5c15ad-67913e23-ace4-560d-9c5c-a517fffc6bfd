@@ -368,3 +368,46 @@ tr.row-dead { background: rgba(248, 113, 113, 0.06); }
 .pv-t-p2s { color: var(--red); }
 .pv-t-s2p { color: var(--green); }
 .pv-t-attr { color: var(--amber); }
+
+/* ---------------- 差异复现包（ddmin） ---------------- */
+.repro-grid { display: grid; grid-template-columns: 3fr 2fr; gap: 16px; margin-top: 12px; }
+@media (max-width: 1000px) { .repro-grid { grid-template-columns: 1fr; } }
+.repro-snap { max-height: 240px; overflow-y: auto; }
+.repro-rounds { display: flex; flex-direction: column; gap: 12px; margin-top: 8px; }
+.repro-round {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2); padding: 8px 12px;
+}
+.repro-round-title {
+  color: var(--accent); font-size: 12.5px; font-weight: 700;
+  margin: 2px 0 6px;
+}
+.repro-log {
+  border-left: 2px solid var(--border); padding: 4px 0 4px 10px;
+  margin: 4px 0; font-size: 12.5px;
+}
+.repro-log > summary {
+  cursor: pointer; list-style: revert; color: var(--muted);
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+}
+.repro-log.is-removed { border-left-color: var(--green); }
+.repro-log.is-retained { border-left-color: var(--red); }
+.repro-log.is-target { border-left-color: var(--muted); }
+.repro-log.is-baseline { border-left-color: var(--accent); }
+.repro-log.is-final { border-left-color: var(--green); background: var(--green-bg); border-radius: 0 6px 6px 0; }
+.repro-phase { color: var(--text); font-weight: 600; font-size: 12px; }
+.repro-gran {
+  font-family: "SF Mono", Consolas, monospace; font-size: 11.5px;
+  color: var(--amber); background: var(--bg); border: 1px solid var(--border);
+  border-radius: 999px; padding: 0 8px;
+}
+.repro-seqs { font-size: 12px; color: var(--accent); white-space: nowrap; }
+.repro-why { flex: 1; min-width: 200px; }
+.repro-ok { color: var(--green); font-size: 12px; margin: 4px 0 2px; }
+.repro-dev-list {
+  list-style: none; margin: 4px 0 2px; padding: 6px 10px;
+  background: var(--bg); border-radius: 6px; font-size: 12px;
+}
+.repro-dev-list li { padding: 2px 0; }
+.repro-dev-list li.a::before { content: "A 侧 · "; color: var(--accent); font-weight: 700; }
+.repro-dev-list li.b::before { content: "B 侧 · "; color: #c084fc; font-weight: 700; }

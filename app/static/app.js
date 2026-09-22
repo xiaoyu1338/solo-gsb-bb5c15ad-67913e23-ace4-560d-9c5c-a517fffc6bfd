@@ -23,6 +23,11 @@ let state = {
   snapshots: [],
   snapCompare: { from: null, to: null, result: null },
   audit: { result: null, filterRuleId: null },
+  repro: {
+    package: null,       // 最近一次生成/导入的差异复现包
+    verification: null,  // 对应只读验证结果
+    imported: false,
+  },
   remediate: {
     suggestions: [], unsupported: [], meta: null,
     history: [], canUndoId: null, lastResult: null,
@@ -1102,14 +1107,301 @@ async function loadCompare() {
     state.compare.result = result;
     renderCompare();
     renderSnapshot();
+    await loadReproCandidates();
   } catch (e) { fail(e); }
+}
+
+// ---------------------------------------------------------------------------
+// Tab 4b: 差异复现包（ddmin 最小化 / 导出 / 只读重新验证）
+// ---------------------------------------------------------------------------
+
+function decisionText(d) {
+  if (!d) return "无记录";
+  return (d.decision === "pass" ? "放行" : "抑制")
+    + (d.rule_id ? ` · #${d.rule_id} ${d.rule_name || ""}` : " · 默认策略");
+}
+
+function reproTargetLabel(c) {
+  return `#${c.seq} ${c.ts || ""} · ${c.device_id || "-"} / ${c.alert_type || "-"} · ` +
+    `${c.level || "info"} — A:${decisionText(c.a)} ⇄ B:${decisionText(c.b)}`;
+}
+
+async function loadReproCandidates() {
+  const sel = $("#repro-target");
+  if (!sel || !state.compare.a) return;
+  try {
+    const data = await api(`/api/diff-repro/candidates?run_a=${state.compare.a}&run_b=${state.compare.b}`);
+    const prev = Number(sel.value) || null;
+    sel.innerHTML = data.candidates.length
+      ? data.candidates.map((c) =>
+          `<option value="${c.alert_id}">${esc(reproTargetLabel(c))}</option>`).join("")
+      : '<option value="">— 两个版本之间没有决定不同的告警 —</option>';
+    if (prev && data.candidates.some((c) => c.alert_id === prev)) sel.value = prev;
+  } catch (e) { fail(e); }
+}
+
+async function generateRepro() {
+  const alertId = Number($("#repro-target").value);
+  if (!alertId) return toast("请先在上方选择一条决定不同的目标告警", true);
+  $("#repro-status").textContent = "ddmin 正在反复删块并重放（两侧独立清空冷却状态），请稍候…";
+  try {
+    const r = await api("/api/diff-repro/minimize", {
+      method: "POST",
+      body: JSON.stringify({
+        run_a: state.compare.a, run_b: state.compare.b, alert_id: alertId,
+      }),
+    });
+    state.repro.package = r.package;
+    state.repro.verification = r.verification;
+    state.repro.imported = false;
+    renderRepro();
+    const d = r.package.ddmin;
+    toast(`最小化完成：${r.package.candidate_count} → ${r.package.minimal_count} 条，` +
+      `${d.rounds} 轮 / ${d.replay_tests} 次试放，且只读重新验证通过`);
+  } catch (e) {
+    $("#repro-status").textContent = "";
+    fail(e);
+  }
+}
+
+function exportRepro() {
+  const pkg = state.repro.package;
+  if (!pkg) return;
+  const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `diff-repro-run${pkg.source?.run_a?.id ?? "A"}-vs-run${pkg.source?.run_b?.id ?? "B"}`
+    + `-seq${pkg.target?.seq ?? "x"}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function reverifyRepro() {
+  const pkg = state.repro.package;
+  if (!pkg) return;
+  try {
+    const v = await api("/api/diff-repro/verify", {
+      method: "POST", body: JSON.stringify(pkg),
+    });
+    state.repro.verification = v;
+    renderReproVerify();
+    toast(v.valid ? "只读重新验证通过：目标结果与期望一致" : "重新验证发现偏离，请查看明细", !v.valid);
+  } catch (e) { fail(e); }
+}
+
+async function verifyImportedRepro() {
+  let pkg;
+  try { pkg = JSON.parse($("#repro-import-json").value); }
+  catch { return toast("JSON 解析失败，请检查复现包内容", true); }
+  try {
+    const v = await api("/api/diff-repro/verify", {
+      method: "POST", body: JSON.stringify(pkg),
+    });
+    state.repro.package = pkg;
+    state.repro.verification = v;
+    state.repro.imported = true;
+    renderRepro();
+    toast(v.valid ? "导入的复现包只读验证通过" : "导入的复现包验证发现偏离", !v.valid);
+  } catch (e) { fail(e); }
+}
+
+function reproRuleChip(r) {
+  const win = `${r.time_window || "全天"} · ${r.date_range || "不限"}`;
+  return `<div class="snap-rule">
+    <div class="top">
+      <b>#${r.id} ${esc(r.name)}</b>
+      ${r.action === "pass" ? '<span class="decision pass">pass</span>' : '<span class="decision suppress">suppress</span>'}
+      <span class="badge">优先级 ${r.priority}</span>
+      ${r.cooldown_seconds ? `<span class="badge">冷却 ${r.cooldown_seconds}s</span>` : ""}
+    </div>
+    <div class="conds">设备 ${esc(r.match_device)} · 批次 ${esc(r.match_batch)} ·
+      级别 ${esc(r.match_level)} · 时段 ${esc(win)}</div>
+  </div>`;
+}
+
+function renderReproRules(boxId, summary) {
+  $(boxId).innerHTML = (summary.rules || []).map(reproRuleChip).join("")
+    || '<p class="empty">快照无启用规则（全部默认放行）</p>';
+}
+
+const REPRO_PHASE_LABEL = {
+  baseline: "基准校验", remove: "删除尝试", granularity: "调整粒度",
+  minimality: "最小性复核", done: "完成",
+};
+
+function reproDeviationsHtml(devs, observed) {
+  if (!devs || !devs.length) {
+    return `<div class="repro-ok">✓ 目标在两侧的决定与命中规则均与原结果一致</div>`;
+  }
+  return `<ul class="repro-dev-list">${devs.map((d) =>
+    `<li class="${d.side}">${esc(d.detail)}</li>`).join("")}</ul>`;
+}
+
+function renderReproRounds(pkg) {
+  const box = $("#repro-rounds");
+  const logs = pkg.ddmin?.logs || [];
+  const groups = new Map();
+  for (const e of logs) {
+    if (!groups.has(e.round)) groups.set(e.round, []);
+    groups.get(e.round).push(e);
+  }
+  box.innerHTML = [...groups.entries()].map(([round, entries]) => {
+    const items = entries.map((e) => {
+      const seqs = (e.chunk_seqs || []).map((s) => `#${s}`).join("、") || "—";
+      let cls = "repro-log";
+      if (e.action === "removed") cls += " is-removed";
+      else if (e.action === "retained" || e.action === "retained_final") cls += " is-retained";
+      else if (e.action === "skipped_target") cls += " is-target";
+      else if (e.action === "final") cls += " is-final";
+      else if (e.action === "baseline") cls += " is-baseline";
+      const act = {
+        removed: '<span class="badge pass">删除 ✓</span>',
+        retained: '<span class="badge suppress">保留 ✗</span>',
+        retained_final: '<span class="badge suppress">保留（最小性复核）</span>',
+        skipped_target: '<span class="badge">跳过：含目标</span>',
+        increase: '<span class="badge">放粗粒度</span>',
+        target: '<span class="badge">目标保留</span>',
+        final: '<span class="badge pass">最小化完成</span>',
+        baseline: e.passes ? '<span class="badge pass">基准一致 ✓</span>' : '<span class="badge suppress">基准偏离</span>',
+      }[e.action] || "";
+      return `<details class="${cls}" ${e.action === "baseline" ? "open" : ""}>
+        <summary>${act}
+          <span class="repro-phase">${REPRO_PHASE_LABEL[e.phase] || e.phase}</span>
+          ${e.granularity != null ? `<span class="repro-gran">n=${e.granularity}</span>` : ""}
+          ${seqs !== "—" ? `<span class="repro-seqs">块 ${seqs}</span>` : ""}
+          <span class="repro-why">${esc(e.reason)}</span>
+        </summary>
+        ${reproDeviationsHtml(e.deviations, e.observed)}
+      </details>`;
+    }).join("");
+    const title = round === 0
+      ? "基准校验"
+      : `第 ${round} 轮（${entries[0].granularity != null ? `切分 n=${entries[0].granularity}` : "最小性复核"}）`;
+    return `<div class="repro-round">
+      <div class="repro-round-title">${title} · 序列 ${entries[0].sequence_size} 条</div>
+      ${items}
+    </div>`;
+  }).join("");
+}
+
+function renderReproVerify() {
+  const v = state.repro.verification;
+  const card = $("#repro-verify-card");
+  if (!v) { card.style.display = "none"; return; }
+  card.style.display = "";
+  const head = v.valid
+    ? '<span class="badge pass">✔ 只读重新验证通过：目标决定与命中规则与期望结果一致</span>'
+    : '<span class="badge suppress">✖ 验证发现偏离：最小序列重放结果与期望不一致</span>';
+  const expRow = (side, label) => {
+    const e = v.expected[side], o = v.observed[side];
+    const same = e && o && e.decision === o.decision && e.rule_id === o.rule_id;
+    return `<tr class="${same ? "" : "row-changed"}">
+      <td>${label}</td>
+      <td>${e ? decisionCell(e) : "-"}</td>
+      <td>${o ? decisionCell(o) : '<span class="badge">无</span>'}</td>
+      <td>${same ? '<span class="no-diff">一致</span>' : '<span class="diff-mark">偏离</span>'}</td>
+    </tr>`;
+  };
+  const devHtml = v.deviations.length
+    ? `<ul class="repro-dev-list">${v.deviations.map((d) =>
+        `<li class="${d.side}">${esc(d.detail)}</li>`).join("")}</ul>`
+    : '<p class="hint" style="margin:6px 0">无偏离。</p>';
+  $("#repro-verify").innerHTML = `
+    <div class="toolbar" style="align-items:center;margin-top:0">
+      ${head}
+      <span class="badge">最小序列 ${v.sequence_length} 条</span>
+      <span class="badge">载入规则 A ${v.rules_loaded.a} 条 / B ${v.rules_loaded.b} 条</span>
+      <span class="badge">只读：未写任何表、未转发</span>
+    </div>
+    ${devHtml}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>侧</th><th>期望结果（包内）</th><th>重放观察</th><th>核对</th></tr></thead>
+        <tbody>${expRow("a", "版本 A")}${expRow("b", "版本 B")}</tbody>
+      </table>
+    </div>
+    <div class="audit-side-title" style="margin-top:10px">最小序列逐条重放（只读）</div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>设备/批次</th><th>级别/类型</th><th>时间</th>
+          <th>A 重放</th><th>B 重放</th><th></th></tr></thead>
+        <tbody>${v.rows.map((r) => `<tr class="${r.is_target ? "row-changed" : ""}">
+          <td>${r.seq}${r.is_target ? ' <span class="diff-mark">目标</span>' : ""}</td>
+          <td>${esc(r.device_id || "-")}<br><span style="color:var(--muted)">${esc(r.batch_id || "-")}</span></td>
+          <td>${levelBadge(r.level)}<br><span style="color:var(--muted)">${esc(r.alert_type || "-")}</span></td>
+          <td style="white-space:nowrap">${esc(r.ts)}</td>
+          <td>${decisionCell(r.a)}</td>
+          <td>${decisionCell(r.b)}</td>
+        </tr>`).join("")}</tbody>
+      </table>
+    </div>`;
+}
+
+function renderRepro() {
+  const pkg = state.repro.package;
+  const resultCard = $("#repro-result-card");
+  const roundsCard = $("#repro-rounds-card");
+  if (!pkg) {
+    resultCard.style.display = "none";
+    roundsCard.style.display = "none";
+    $("#btn-repro-export").disabled = true;
+    $("#btn-repro-reverify").disabled = true;
+    renderReproVerify();
+    return;
+  }
+  resultCard.style.display = "";
+  roundsCard.style.display = "";
+  $("#btn-repro-export").disabled = false;
+  $("#btn-repro-reverify").disabled = false;
+
+  const t = pkg.target;
+  const e = pkg.expected;
+  const src = pkg.source || {};
+  const meta = (x) => x ? `#${x.id} ${x.kind === "live" ? "[实时链]" : "[回放]"} ${x.note || ""}` : "?";
+  $("#repro-status").innerHTML =
+    `目标 <b>#${esc(t.seq)}</b>（${esc(t.device_id || "-")} / ${esc(t.alert_type || "-")} · ${esc(t.level || "")}）：` +
+    `版本 A <b>${esc(meta(src.run_a))}</b> 中 ${e.a.decision === "pass" ? "放行" : "抑制"}` +
+    `（${e.a.rule_id ? `#${e.a.rule_id} ${esc(e.a.rule_name || "")}` : "默认策略"}） ⇄ ` +
+    `版本 B <b>${esc(meta(src.run_b))}</b> 中 ${e.b.decision === "pass" ? "放行" : "抑制"}` +
+    `（${e.b.rule_id ? `#${e.b.rule_id} ${esc(e.b.rule_name || "")}` : "默认策略"}）`;
+
+  $("#repro-summary").innerHTML =
+    `候选（目标前缀）<b>${pkg.candidate_count}</b> 条 → 最小序列 <b>${pkg.minimal_count}</b> 条 ·
+     ddmin 共 <b>${pkg.ddmin.rounds}</b> 轮、<b>${pkg.ddmin.replay_tests}</b> 次两侧独立试放
+     （每轮均分别载入两个 run 的规则快照、清空冷却状态、按原 seq/ts 重放）·
+     规则快照：A 侧 <b>${pkg.rule_snapshot_summary.a.rule_count}</b> 条 /
+     B 侧 <b>${pkg.rule_snapshot_summary.b.rule_count}</b> 条 ·
+     复现包类型 <code>${esc(pkg.package_type)}</code> · 导出于 ${esc(pkg.exported_at || "")}
+     ${state.repro.imported ? ' · <span class="badge">当前展示的是导入的复现包</span>' : ""}`;
+
+  const v = state.repro.verification;
+  const rowsBySeq = new Map((v?.rows || []).map((r) => [r.seq, r]));
+  $("#repro-minimal-body").innerHTML = pkg.minimal_sequence.map((a) => {
+    const vr = rowsBySeq.get(a.seq);
+    return `<tr class="${vr?.is_target ? "row-changed" : ""}">
+      <td>${a.seq}${vr?.is_target ? ' <span class="diff-mark">目标</span>' : ""}</td>
+      <td>${esc(a.device_id || "-")}<br><span style="color:var(--muted)">${esc(a.batch_id || "-")}</span></td>
+      <td>${levelBadge(a.level)}<br><span style="color:var(--muted)">${esc(a.alert_type || "-")}</span></td>
+      <td style="white-space:nowrap">${esc(a.ts)}</td>
+      <td>${vr ? decisionCell(vr.a) : '<span class="badge">未验证</span>'}</td>
+      <td>${vr ? decisionCell(vr.b) : '<span class="badge">未验证</span>'}</td>
+    </tr>`;
+  }).join("");
+
+  renderReproRules("#repro-rules-a", pkg.rule_snapshot_summary.a);
+  renderReproRules("#repro-rules-b", pkg.rule_snapshot_summary.b);
+  renderReproRounds(pkg);
+  renderReproVerify();
 }
 
 function decisionCell(d) {
   if (!d) return '<span class="badge">无记录</span>';
   return `<span class="decision ${d.decision}">${d.decision === "pass" ? "放行" : "抑制"}</span>
           <div style="color:var(--muted);margin-top:3px;font-size:11.5px">
-            ${d.rule_id ? `#${d.rule_id} ${esc(d.rule_name)}` : "默认策略"}</div>`;
+            ${d.rule_id ? `#${d.rule_id} ${esc(d.rule_name || "")}` : "默认策略"}</div>`;
 }
 
 function renderCompare() {
@@ -1357,6 +1649,14 @@ function bind() {
   $("#btn-replay").addEventListener("click", doReplay);
   $("#cmp-a").addEventListener("change", loadCompare);
   $("#cmp-b").addEventListener("change", loadCompare);
+  $("#btn-repro-run").addEventListener("click", generateRepro);
+  $("#btn-repro-export").addEventListener("click", exportRepro);
+  $("#btn-repro-reverify").addEventListener("click", reverifyRepro);
+  $("#btn-repro-import-toggle").addEventListener("click", () => {
+    const box = $("#repro-import-box");
+    box.style.display = box.style.display === "none" ? "" : "none";
+  });
+  $("#btn-repro-verify-import").addEventListener("click", verifyImportedRepro);
   $("#btn-save-settings").addEventListener("click", saveSettings);
   $("#btn-test-mock").addEventListener("click", testMock);
   $("#btn-clear-logs").addEventListener("click", async () => {

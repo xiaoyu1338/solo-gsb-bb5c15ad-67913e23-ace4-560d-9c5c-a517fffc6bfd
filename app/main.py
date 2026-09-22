@@ -42,6 +42,8 @@ from .remediation import (
     plan_draft,
     validate_remediation,
 )
+from . import repro
+from .repro import BaselineMismatch
 
 app = FastAPI(title="冷链告警抑制策略沙盒", version="1.0.0")
 
@@ -1520,6 +1522,186 @@ def compare_runs(run_a: int, run_b: Optional[int] = None):
                 "total": len(rows_out)}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 差异复现包：ddmin 最小化 + JSON 导出 + 只读重新验证
+# （全部只读计算：不写入 alerts / decisions / runs，不触发任何转发）
+# ---------------------------------------------------------------------------
+
+def _load_run_snapshot(conn, run_id: int) -> tuple[dict, list[dict]]:
+    run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not run:
+        raise HTTPException(404, f"run {run_id} 不存在")
+    snapshot = json.loads(run["rule_snapshot"])
+    return dict(run), snapshot
+
+
+def _stored_decision_map(conn, run_id: int) -> dict[int, dict]:
+    rows = conn.execute(
+        "SELECT * FROM decisions WHERE run_id=?", (run_id,)
+    ).fetchall()
+    return {r["alert_id"]: _decision_dict(r) for r in rows}
+
+
+def _prefix_alert_rows(conn, alert_id: int):
+    """目标告警及其之前（按 seq 升序）的全部已注入告警行。"""
+    target = conn.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone()
+    if not target:
+        raise HTTPException(404, "目标告警不存在")
+    rows = conn.execute(
+        "SELECT * FROM alerts WHERE seq <= ? ORDER BY seq", (target["seq"],)
+    ).fetchall()
+    return target, rows
+
+
+def _prefix_alert_dicts(rows) -> list[dict]:
+    alerts = []
+    for row in rows:
+        alert = _alert_dict(row)
+        alert["ts"] = datetime.fromisoformat(alert["ts"])
+        alerts.append(alert)
+    return alerts
+
+
+@app.get("/api/diff-repro/candidates")
+def diff_repro_candidates(run_a: int, run_b: Optional[int] = None):
+    """列出两个 run 中**决定不同**的目标告警（只读）。
+
+    差异复现包要求目标在两侧的决定原本就不同；命中规则不同但决定相同的条目也
+    一并在 ``rule_only_diff`` 中返回供参考，但不能作为最小化目标。
+    """
+    conn = db.get_conn()
+    try:
+        live_id = _live_run_id(conn)
+        run_b = run_b or live_id
+        run_a_row = conn.execute("SELECT * FROM runs WHERE id=?", (run_a,)).fetchone()
+        run_b_row = conn.execute("SELECT * FROM runs WHERE id=?", (run_b,)).fetchone()
+        if not run_a_row:
+            raise HTTPException(404, f"run {run_a} 不存在")
+        if not run_b_row:
+            raise HTTPException(404, f"run {run_b} 不存在")
+        da = _stored_decision_map(conn, run_a)
+        db_ = _stored_decision_map(conn, run_b)
+        alerts = conn.execute("SELECT * FROM alerts ORDER BY seq").fetchall()
+        targets, rule_only = [], []
+        for a in alerts:
+            x, y = da.get(a["id"]), db_.get(a["id"])
+            if not x or not y:
+                continue
+            item = {
+                "alert_id": a["id"], "seq": a["seq"],
+                "device_id": a["device_id"], "batch_id": a["batch_id"],
+                "level": a["level"], "alert_type": a["alert_type"],
+                "message": a["message"], "ts": a["ts"],
+                "a": {"decision": x["decision"], "rule_id": x["rule_id"],
+                      "rule_name": x["rule_name"]},
+                "b": {"decision": y["decision"], "rule_id": y["rule_id"],
+                      "rule_name": y["rule_name"]},
+            }
+            if x["decision"] != y["decision"]:
+                targets.append(item)
+            elif x["rule_id"] != y["rule_id"]:
+                rule_only.append(item)
+        return {
+            "run_a": {"id": run_a_row["id"], "kind": run_a_row["kind"],
+                      "note": run_a_row["note"], "created_at": run_a_row["created_at"]},
+            "run_b": {"id": run_b_row["id"], "kind": run_b_row["kind"],
+                      "note": run_b_row["note"], "created_at": run_b_row["created_at"]},
+            "candidates": targets,
+            "candidate_count": len(targets),
+            "rule_only_diff": rule_only,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/diff-repro/minimize")
+def diff_repro_minimize(payload: dict = Body(...)):
+    """生成差异复现包：ddmin 反复删块，两侧各自载入 run 规则快照、清空冷却状态重放。
+
+    请求：``{"run_a": int, "run_b": int?, "alert_id": int}``。全程只读内存计算——
+    不写入 alerts / decisions / runs，不转发任何告警。返回自包含的复现包
+    （最小告警序列 + 两侧规则快照摘要/全量 + 期望结果 + 逐轮日志）与最小序列的
+    只读重放行，可直接导出 JSON 或再次提交到只读重新验证接口。
+    """
+    body = payload or {}
+    try:
+        alert_id = int(body["alert_id"])
+        run_a_id = int(body["run_a"])
+        run_b_id = int(body.get("run_b") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "run_a / run_b / alert_id 必须是整数")
+
+    conn = db.get_conn()
+    try:
+        live_id = _live_run_id(conn)
+        run_b_id = run_b_id or live_id
+        if run_a_id == run_b_id:
+            raise HTTPException(400, "请选择两个不同的 run 作为版本 A / 版本 B")
+        run_a_row, snapshot_a = _load_run_snapshot(conn, run_a_id)
+        run_b_row, snapshot_b = _load_run_snapshot(conn, run_b_id)
+        target_row, prefix_rows = _prefix_alert_rows(conn, alert_id)
+        da = _stored_decision_map(conn, run_a_id)
+        db_ = _stored_decision_map(conn, run_b_id)
+        dxa, dxb = da.get(target_row["id"]), db_.get(target_row["id"])
+        if not dxa or not dxb:
+            raise HTTPException(400, "目标告警在所选 run 的一侧没有评估记录，请改选其他目标")
+        if dxa["decision"] == dxb["decision"]:
+            raise HTTPException(
+                400,
+                f"目标 #{target_row['seq']} 在两个 run 中决定相同（均为 {dxa['decision']}）；"
+                "差异复现包仅支持决定不同的目标告警",
+            )
+
+        prefix = _prefix_alert_dicts(prefix_rows)
+        target = next(a for a in prefix if a["id"] == target_row["id"])
+        expected = {
+            "a": {k: dxa[k] for k in ("decision", "rule_id", "rule_name", "reason")},
+            "b": {k: dxb[k] for k in ("decision", "rule_id", "rule_name", "reason")},
+        }
+        expected["a"]["run_id"] = run_a_id
+        expected["b"]["run_id"] = run_b_id
+        source_meta = {
+            "run_a": {"id": run_a_id, "kind": run_a_row["kind"],
+                      "note": run_a_row["note"], "created_at": run_a_row["created_at"]},
+            "run_b": {"id": run_b_id, "kind": run_b_row["kind"],
+                      "note": run_b_row["note"], "created_at": run_b_row["created_at"]},
+            "target_alert_id": target_row["id"],
+        }
+        try:
+            package = repro.build_package(
+                prefix, run_a_id, run_b_id, snapshot_a, snapshot_b,
+                target, expected, source_meta,
+            )
+        except BaselineMismatch as exc:
+            raise HTTPException(
+                409,
+                "目标前缀在全新冷却状态下无法复现 run 中存储的原结果，最小化前提不成立："
+                + "；".join(d["detail"] for d in exc.deviations)
+                + "（常见原因：live 链是用历史版本规则评估的，而 run 快照只保存当前启用规则；"
+                  "请改用「用当前规则生成回放」的两个 replay run 做对比）",
+            )
+        verification = repro.verify_package(package)
+        return {"package": package, "verification": verification}
+    finally:
+        conn.close()
+
+
+@app.post("/api/diff-repro/verify")
+def diff_repro_verify(payload: dict = Body(...)):
+    """对差异复现包做**只读重新验证**（可使用导出的 JSON 离线执行）。
+
+    请求体即复现包对象，或 ``{"package": {...}}``。系统载入包内两份 run 规则快照，
+    两侧均从空冷却状态按最小序列的原 seq/ts 重放，核对目标的决定与命中规则是否
+    仍与期望结果一致。不访问业务表、不写任何数据、不转发。
+    """
+    body = payload or {}
+    pkg = body.get("package") if isinstance(body.get("package"), dict) else body
+    try:
+        return repro.verify_package(pkg)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 # ---------------------------------------------------------------------------

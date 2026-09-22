@@ -332,6 +332,66 @@
         </table>
       </div>
     </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>🧬 差异复现包（ddmin 最小化） <span class="badge" id="repro-readonly-badge">全程只读 · 不落库 · 不转发</span></h2>
+      <p class="hint">从两个 run 中选择一条<strong>决定不同</strong>的目标告警，系统以<strong>目标前缀</strong>（截至目标的全部告警）为候选，
+        用 <code>ddmin</code> 反复删块：每一轮都<strong>分别载入两个 run 当时的规则快照、两侧各自清空冷却状态、按原 seq/ts 重放</strong>，
+        直到再删任一告警都会使目标在任一侧的<strong>决定或命中规则</strong>偏离原结果。页面展示每一轮的<strong>删减与保留原因</strong>，
+        可导出含<strong>最小告警序列、两侧规则快照摘要与期望结果</strong>的自包含 JSON，并支持把该 JSON 导入做<strong>只读重新验证</strong>。
+        该功能不会写入 <code>alerts / decisions / runs</code>，也不会触发任何转发。</p>
+      <div class="toolbar" style="align-items:flex-end">
+        <label style="margin:0;flex:1;min-width:320px">决定不同的目标告警（取自上方所选版本 A / B）
+          <select id="repro-target"><option value="">— 先选择版本并加载逐条对比 —</option></select>
+        </label>
+        <button class="btn primary" id="btn-repro-run">🧬 生成差异复现包（ddmin）</button>
+        <button class="btn" id="btn-repro-export" disabled>⬇ 导出复现包 JSON</button>
+        <button class="btn" id="btn-repro-reverify" disabled>🔁 只读重新验证当前包</button>
+        <button class="btn ghost" id="btn-repro-import-toggle">导入 JSON 重新验证</button>
+      </div>
+      <div id="repro-import-box" style="display:none;margin-top:10px">
+        <textarea id="repro-import-json" rows="6" placeholder="粘贴此前导出的差异复现包 JSON（cold-chain-diff-repro）"></textarea>
+        <div class="toolbar">
+          <button class="btn primary" id="btn-repro-verify-import">🔁 只读验证导入的复现包</button>
+        </div>
+      </div>
+      <div id="repro-status" class="summary"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px;display:none" id="repro-result-card">
+      <h2>复现包内容：最小告警序列 + 期望结果 + 规则快照摘要</h2>
+      <div id="repro-summary" class="summary" style="margin-top:0"></div>
+      <div class="repro-grid">
+        <div>
+          <div class="audit-side-title">最小告警序列（按此顺序、原 ts 重放；两侧均从空冷却状态开始）</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>#</th><th>设备/批次</th><th>级别/类型</th><th>时间</th>
+                <th>重放 A</th><th>重放 B</th><th></th></tr></thead>
+              <tbody id="repro-minimal-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <div class="audit-side-title">规则快照摘要（版本 A）</div>
+          <div id="repro-rules-a" class="snapshot repro-snap"></div>
+          <div class="audit-side-title" style="margin-top:8px">规则快照摘要（版本 B）</div>
+          <div id="repro-rules-b" class="snapshot repro-snap"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px;display:none" id="repro-rounds-card">
+      <h2>ddmin 逐轮删减与保留原因</h2>
+      <p class="hint">每个条目是一次删除尝试：<b>删除</b>表示删掉该块后目标在两侧的决定与命中规则仍与原结果一致；
+        <b>保留</b>表示删掉后目标发生偏离（列出偏离侧与原因）；粒度行表示所有非目标块均不可删后放粗切分继续尝试。</p>
+      <div id="repro-rounds" class="repro-rounds"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px;display:none" id="repro-verify-card">
+      <h2>只读重新验证结果</h2>
+      <div id="repro-verify"></div>
+    </div>
   </section>
 
   <!-- ===================== 模拟接收端 ===================== -->
