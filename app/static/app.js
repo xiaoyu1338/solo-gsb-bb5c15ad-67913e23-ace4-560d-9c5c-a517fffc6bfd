@@ -19,6 +19,7 @@ let state = {
   runs: [],
   settings: {},
   compare: { a: null, b: null, result: null },
+  repro: { result: null },
   events: { events: [], devices: [], gap_seconds: 900 },
   snapshots: [],
   snapCompare: { from: null, to: null, result: null },
@@ -1100,8 +1101,12 @@ async function loadCompare() {
   try {
     const result = await api(`/api/compare?run_a=${a}&run_b=${b}`);
     state.compare.result = result;
+    // 切换对比版本后，旧复现包不再对应当前两侧，清空目标选择与结果
+    state.repro.result = null;
     renderCompare();
     renderSnapshot();
+    renderReproTargets();
+    renderReproResult();
   } catch (e) { fail(e); }
 }
 
@@ -1153,6 +1158,228 @@ function renderSnapshot() {
     </div>`;
   }).join("") || '<p class="empty">无规则</p>';
 }
+
+// ---------------------------------------------------------------------------
+// Tab 4b: 差异复现包（ddmin 最小化 · 只读 · 不落库不转发）
+// ---------------------------------------------------------------------------
+
+function renderReproTargets() {
+  const sel = $("#repro-target");
+  if (!sel) return;
+  const rows = (state.compare.result?.rows || []).filter((r) => r.changed && r.a && r.b);
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">— 请选择差异告警 —</option>' + rows.map((r) => {
+    const a = r.alert;
+    return `<option value="${a.id}">#${a.seq} ${esc(a.device_id || "-")} ${esc(a.alert_type || "")} ` +
+      `${esc(a.ts)} · A:${r.a.decision === "pass" ? "放行" : "抑制"} → B:${r.b.decision === "pass" ? "放行" : "抑制"}` +
+      `</option>`;
+  }).join("");
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+function reproOutcomeHtml(o) {
+  if (!o) return '<span class="badge">无记录</span>';
+  return `<span class="decision ${o.decision}">${o.decision === "pass" ? "放行" : "抑制"}</span>
+          <span class="badge">${o.rule_id ? `命中 #${o.rule_id}` : "默认策略"}</span>`;
+}
+
+function reproSnapshotHtml(block, title) {
+  const rules = block.rules || [];
+  return `<div class="repro-snap">
+    <div class="repro-snap-head">
+      <b>${title}</b>
+      <span class="badge">run #${block.run_id}</span>
+      <span class="badge">规则 ${block.enabled_count}/${block.rule_count} 启用</span>
+      <code class="repro-digest">sha256:${esc(block.digest_sha256.slice(0, 16))}…</code>
+    </div>
+    <div class="snapshot" style="max-height:180px;margin-top:6px">${rules.map((r) => {
+      const m = ruleMatches(r);
+      return `<div class="snap-rule"${r.enabled ? "" : ' style="opacity:0.5"'}>
+        <div class="top"><b>#${r.id} ${esc(r.name)}</b>
+          ${r.action === "pass" ? '<span class="decision pass">pass</span>' : '<span class="decision suppress">suppress</span>'}
+          <span class="badge">优先级 ${r.priority}</span>
+          ${r.cooldown_seconds ? `<span class="badge">冷却 ${r.cooldown_seconds}s</span>` : ""}
+          ${r.enabled ? "" : '<span class="badge suppress">停用</span>'}
+        </div>
+        <div class="conds">设备 ${esc(m.dev)} · 批次 ${esc(m.batch)} · 级别 ${esc(m.lvl)} · 时段 ${esc(m.time)} · 日期 ${esc(m.dates)}</div>
+      </div>`;
+    }).join("")}</div>
+  </div>`;
+}
+
+function reproRoundsHtml(rounds) {
+  return rounds.map((rnd) => {
+    const chunks = rnd.chunks.map((c) => {
+      const seqs = c.alert_seqs.map((s) => `<span class="seq-chip">#${s}</span>`).join(" ");
+      return `<li class="repro-chunk ${c.removed ? "is-removed" : "is-kept"}">
+        <span class="badge ${c.removed ? "pass" : "suppress"}">${c.removed ? "✂ 已删块" : "🔒 保留"}</span>
+        <span class="repro-chunk-seqs">${seqs}</span>
+        <span class="repro-chunk-reason">${esc(c.reason)}</span>
+      </li>`;
+    }).join("");
+    return `<details class="repro-round" ${rnd.round === rounds.length ? " open" : ""}>
+      <summary>第 ${rnd.round} 轮 · 粒度 n=${rnd.n} · ${rnd.chunk_count} 块 ·
+        删后保留 ${rnd.kept_size} 条 · ${rnd.removed_any ? '<b style="color:var(--green)">本轮删减成功</b>' : '<b style="color:var(--amber)">全部保留，加细粒度</b>'}</summary>
+      <ul class="repro-chunks">${chunks}</ul>
+    </details>`;
+  }).join("");
+}
+
+function renderReproResult() {
+  const box = $("#repro-result");
+  if (!box) return;
+  const r = state.repro.result;
+  if (!r) { box.innerHTML = ""; return; }
+  const t = r.target;
+  const st = r.stats;
+  const minRows = r.minimal_alerts.map((a) => {
+    const isTarget = a.id === t.id;
+    return `<tr class="${isTarget ? "row-changed" : ""}">
+      <td>${a.seq}${isTarget ? ' <span class="diff-mark">目标</span>' : ""}</td>
+      <td>${esc(a.ts)}</td>
+      <td>${esc(a.device_id || "-")}</td>
+      <td>${esc(a.batch_id || "-")}</td>
+      <td>${levelBadge(a.level)}</td>
+      <td>${esc(a.alert_type || "-")}</td>
+      <td style="max-width:240px">${esc(a.message || "")}</td>
+    </tr>`;
+  }).join("");
+  box.innerHTML = `
+    <div class="summary" style="margin-top:14px">
+      目标 <b>#${t.seq} ${esc(t.device_id || "-")} ${esc(t.alert_type || "")}</b>（${esc(t.ts)}）：
+      A 侧 ${reproOutcomeHtml(r.expected.a)}，B 侧 ${reproOutcomeHtml(r.expected.b)}；
+      候选前缀 <b>${r.prefix_size}</b> 条 → 最小序列 <b style="color:var(--accent)">${st.minimal_size}</b> 条
+      （删减 ${r.removed_alerts.length} 条）· ddmin 共 <b>${st.round_count}</b> 轮、<b>${st.test_count}</b> 次成员测试。
+      每次测试均重新载入对应 run 的规则快照并清空冷却状态，全程不落库、不转发。
+    </div>
+    <div class="toolbar" style="align-items:center">
+      <button class="btn primary" id="btn-repro-download">⬇ 导出差异复现包 JSON</button>
+      <button class="btn" id="btn-repro-fill-verify">↪ 填入下方重新验证</button>
+      <span class="badge">包摘要 sha256:${esc(r.package.package_digest_sha256.slice(0, 16))}…</span>
+    </div>
+    <div class="repro-grid">
+      <div>
+        <div class="audit-side-title">最小告警序列（按原 seq/ts 重放，${st.minimal_size} 条）</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>#</th><th>时间</th><th>设备</th><th>批次</th><th>级别</th><th>类型</th><th>内容</th></tr></thead>
+            <tbody>${minRows}</tbody>
+          </table>
+        </div>
+        <div class="audit-side-title" style="margin-top:10px">逐轮删减与保留原因（${st.round_count} 轮）</div>
+        <div class="repro-rounds">${st.round_count
+          ? reproRoundsHtml(r.rounds)
+          : '<p class="empty" style="padding:10px">目标前缀只有目标自身 1 条，已是最小序列，无需 ddmin 删减。</p>'}</div>
+      </div>
+      <div>
+        <div class="audit-side-title">规则快照摘要（重放时分别载入）</div>
+        ${reproSnapshotHtml(r.package.rule_snapshots.a, `A 侧 · #${r.run_a.id} ${esc(r.run_a.note || r.run_a.kind)}`)}
+        <div style="height:8px"></div>
+        ${reproSnapshotHtml(r.package.rule_snapshots.b, `B 侧 · #${r.run_b.id} ${esc(r.run_b.note || r.run_b.kind)}`)}
+      </div>
+    </div>`;
+}
+
+async function runReproMinimize() {
+  const targetId = Number($("#repro-target").value);
+  if (!targetId) return toast("请先选择一条决定不同的目标告警", true);
+  const a = Number($("#cmp-a").value);
+  const b = Number($("#cmp-b").value);
+  try {
+    const r = await api("/api/compare/repro/minimize", {
+      method: "POST",
+      body: JSON.stringify({ run_a: a, run_b: b, target_alert_id: targetId }),
+    });
+    state.repro.result = r;
+    renderReproResult();
+    toast(`最小化完成：${r.stats.initial_size} → ${r.stats.minimal_size} 条（${r.stats.round_count} 轮 / ${r.stats.test_count} 次测试），可导出 JSON`);
+  } catch (e) { fail(e); }
+}
+
+function downloadReproPackage() {
+  const r = state.repro.result;
+  if (!r) return;
+  const blob = new Blob([JSON.stringify(r.package, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const aTag = document.createElement("a");
+  aTag.href = url;
+  aTag.download = `difference-repro-run${r.run_a.id}-vs-${r.run_b.id}-target-seq${r.target.seq}.json`;
+  document.body.appendChild(aTag);
+  aTag.click();
+  aTag.remove();
+  URL.revokeObjectURL(url);
+}
+
+function renderReproVerify(v) {
+  const box = $("#repro-verify-result");
+  if (!v) { box.innerHTML = ""; return; }
+  const banner = v.ok
+    ? `<div class="repro-verify ok">✔ 只读重新验证通过：目标告警在 A/B 两侧均重现期望结果` +
+      (v.difference_reproduced ? "，<b>差异成功复现</b>" : "（但两侧决定相同，未复现差异）") + `</div>`
+    : `<div class="repro-verify fail">✖ 重新验证未通过：最小序列/规则快照无法重现期望结果</div>`;
+  const digest = v.digest_matches
+    ? '<span class="badge pass">✔ 包内容哈希一致（未被篡改）</span>'
+    : '<span class="badge suppress">✖ 包内容哈希不一致（快照或序列已被改动）</span>';
+  const cc = v.cross_check;
+  let cross = "";
+  if (cc) {
+    if (!cc.run_a_present || !cc.run_b_present) {
+      cross = `<div class="hint" style="margin:6px 0 0">当前数据库中找不到包记录的 run（run A 存在：${cc.run_a_present}，run B 存在：${cc.run_b_present}）；以上结论完全来自包内自包含数据。</div>`;
+    } else {
+      cross = `<div class="hint" style="margin:6px 0 0">当前数据库跨校验：run A 快照${cc.snapshot_a_unchanged ? "一致" : "<b style='color:var(--red)'>已变化</b>"} · run B 快照${cc.snapshot_b_unchanged ? "一致" : "<b style='color:var(--red)'>已变化</b>"}（附加信息，不影响自包含验证结论）。</div>`;
+    }
+  }
+  box.innerHTML = `
+    ${banner}
+    <div class="toolbar" style="align-items:center;margin-top:8px">
+      ${digest}
+      <span class="badge">最小序列 ${v.minimal_alert_count} 条</span>
+    </div>
+    <div class="table-wrap" style="margin-top:6px">
+      <table>
+        <thead><tr><th>侧</th><th>期望结果</th><th>重放实际结果</th><th>校验</th></tr></thead>
+        <tbody>
+          ${["a", "b"].map((side) => {
+            const e = v.expected[side], ac = v.actual[side];
+            const cell = (o) => o
+              ? `<span class="decision ${o.decision}">${o.decision === "pass" ? "放行" : "抑制"}</span> ${o.rule_id ? `<span class="badge">#${o.rule_id}</span>` : '<span class="badge">默认</span>'}`
+              : '<span class="badge suppress">缺失</span>';
+            const c = v.checks.find((x) => x.side === side);
+            return `<tr>
+              <td><b>${side.toUpperCase()} 侧</b></td>
+              <td>${cell(e)}</td>
+              <td>${cell(ac)}</td>
+              <td>${c.passed ? '<span class="no-diff">✔ 一致</span>' : '<span class="diff-mark">✖ 偏离</span>'}
+                <div style="color:var(--muted);font-size:11.5px;margin-top:2px">${esc(c.reason)}</div></td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>${cross}`;
+}
+
+async function verifyReproPackage(pkg) {
+  try {
+    const v = await api("/api/compare/repro/verify", {
+      method: "POST", body: JSON.stringify(pkg),
+    });
+    renderReproVerify(v);
+    toast(v.ok && v.difference_reproduced
+      ? "重新验证通过：差异已复现，包内容未被篡改"
+      : v.ok ? "验证通过但未复现两侧差异" : "重新验证未通过", !v.ok);
+  } catch (e) { fail(e); }
+}
+
+async function verifyPastedRepro() {
+  let pkg;
+  try {
+    pkg = JSON.parse($("#repro-verify-json").value);
+  } catch {
+    return toast("复现包 JSON 解析失败，请检查格式", true);
+  }
+  await verifyReproPackage(pkg);
+}
+
 
 // ---------------------------------------------------------------------------
 // Tab 5: 模拟接收端
@@ -1270,6 +1497,15 @@ document.addEventListener("click", async (e) => {
   if (ds.remUndo) {
     await undoRemediation(Number(ds.remUndo));
   }
+  if (t.closest("#btn-repro-download")) {
+    downloadReproPackage();
+  }
+  if (t.closest("#btn-repro-fill-verify")) {
+    if (state.repro.result) {
+      $("#repro-verify-json").value = JSON.stringify(state.repro.result.package, null, 2);
+      toast("已填入刚生成的复现包 JSON，点击「重新验证」即可只读复验");
+    }
+  }
 });
 
 // 规则变更后若审计页已加载过结果，按当前筛选重新审计（不影响任何 live/replay 数据）
@@ -1304,6 +1540,10 @@ function bind() {
     if (btn.dataset.tab === "evolution") loadSnapshots().catch(fail);
     if (btn.dataset.tab === "audit") loadAudit().catch(fail);
     if (btn.dataset.tab === "remediate") loadRemData().catch(fail);
+    if (btn.dataset.tab === "compare" && !state.compare.result
+        && $("#cmp-a")?.value && $("#cmp-b")?.value) {
+      loadCompare().catch(fail);
+    }
   }));
 
   $("#btn-inject-next").addEventListener("click", () => doInject(true));
@@ -1357,6 +1597,26 @@ function bind() {
   $("#btn-replay").addEventListener("click", doReplay);
   $("#cmp-a").addEventListener("change", loadCompare);
   $("#cmp-b").addEventListener("change", loadCompare);
+  $("#btn-repro-min").addEventListener("click", runReproMinimize);
+  $("#btn-repro-verify-paste").addEventListener("click", verifyPastedRepro);
+  $("#btn-repro-verify-current").addEventListener("click", () => {
+    if (!state.repro.result) return toast("请先生成差异复现包", true);
+    $("#repro-verify-json").value = JSON.stringify(state.repro.result.package, null, 2);
+    return verifyReproPackage(state.repro.result.package);
+  });
+  $("#repro-verify-file").addEventListener("change", (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      $("#repro-verify-json").value = reader.result;
+      let pkg;
+      try { pkg = JSON.parse(reader.result); }
+      catch { return toast("文件内容不是合法 JSON", true); }
+      return verifyReproPackage(pkg);
+    };
+    reader.readAsText(file);
+  });
   $("#btn-save-settings").addEventListener("click", saveSettings);
   $("#btn-test-mock").addEventListener("click", testMock);
   $("#btn-clear-logs").addEventListener("click", async () => {

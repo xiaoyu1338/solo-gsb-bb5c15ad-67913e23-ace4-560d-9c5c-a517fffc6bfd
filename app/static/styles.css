@@ -368,3 +368,39 @@ tr.row-dead { background: rgba(248, 113, 113, 0.06); }
 .pv-t-p2s { color: var(--red); }
 .pv-t-s2p { color: var(--green); }
 .pv-t-attr { color: var(--amber); }
+
+/* ---------------- 差异复现包（ddmin 最小化） ---------------- */
+.repro-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; margin-top: 12px; }
+@media (max-width: 1000px) { .repro-grid { grid-template-columns: 1fr; } }
+.repro-digest { font-size: 11px; color: var(--muted); }
+.repro-snap {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; background: var(--panel-2);
+}
+.repro-snap-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.repro-rounds { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.repro-round {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-2); padding: 6px 10px; font-size: 12.5px;
+}
+.repro-round summary { cursor: pointer; color: var(--text); }
+.repro-chunks { list-style: none; margin: 8px 0 4px; padding: 0; }
+.repro-chunk {
+  display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap;
+  border-left: 2px solid var(--border); padding: 5px 0 5px 10px; margin: 4px 0;
+}
+.repro-chunk.is-removed { border-left-color: var(--green); }
+.repro-chunk.is-kept { border-left-color: var(--red); }
+.repro-chunk-seqs { display: flex; gap: 3px; flex-wrap: wrap; }
+.repro-chunk-reason { flex: 1; min-width: 220px; color: var(--muted); font-size: 12px; }
+.repro-verify {
+  border-radius: 8px; padding: 9px 12px; font-size: 13px; margin-top: 10px;
+}
+.repro-verify.ok {
+  border: 1px solid rgba(52, 211, 153, 0.4);
+  background: var(--green-bg); color: var(--green);
+}
+.repro-verify.fail {
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  background: var(--red-bg); color: var(--red);
+}

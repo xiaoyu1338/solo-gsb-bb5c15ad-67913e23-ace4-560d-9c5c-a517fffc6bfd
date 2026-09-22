@@ -42,6 +42,13 @@ from .remediation import (
     plan_draft,
     validate_remediation,
 )
+from .repro import (
+    TargetOutcome,
+    build_package,
+    canonical_json,
+    minimize as repro_minimize,
+    verify_package,
+)
 
 app = FastAPI(title="冷链告警抑制策略沙盒", version="1.0.0")
 
@@ -1518,6 +1525,207 @@ def compare_runs(run_a: int, run_b: Optional[int] = None):
         return {"run_a": run_meta(run_a), "run_b": run_meta(run_b),
                 "rows": rows_out, "changed_count": changed,
                 "total": len(rows_out)}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 差异复现包：ddmin 最小化 + 自包含 JSON 导出 + 只读重新验证
+# （全部为只读计算：只 SELECT，绝不写入 alerts/decisions/runs，也不转发）
+# ---------------------------------------------------------------------------
+
+def _repro_targets(conn, run_a_id: int, run_b_id: int) -> dict:
+    """收集两个 run 之间决定不同的告警 id 集合（差异复现包的候选目标）。"""
+    def decisions(rid: int) -> dict[int, str]:
+        rows = conn.execute(
+            "SELECT alert_id, decision FROM decisions WHERE run_id=?", (rid,)
+        ).fetchall()
+        return {r["alert_id"]: r["decision"] for r in rows}
+
+    da, db_ = decisions(run_a_id), decisions(run_b_id)
+    return {aid for aid, dec in da.items() if aid in db_ and db_[aid] != dec}
+
+
+@app.post("/api/compare/repro/minimize")
+def compare_repro_minimize(payload: dict = Body(...)):
+    """生成差异复现包：以目标前缀为候选用 ddmin 反复删块（只读，不落库、不转发）。
+
+    请求体 ``{"run_a": int, "run_b": int, "target_alert_id": int}``。流程：
+
+    1. 校验两个 run 存在，且目标告警在两侧都有决定、决定确实不同（否则 400）；
+    2. 候选 = 原 seq 不大于目标的全部已注入告警（目标前缀），按 (seq, id) 排序；
+    3. 分别载入两个 run **当时的规则快照**，每次成员测试都使用**全新冷却状态**
+       （``EvalState`` 从零开始），按原 seq/ts 重放候选子集；
+    4. ddmin 反复删块，直到再删任一条告警都会使目标在任一侧的
+       ``(决定, 命中规则)`` 偏离原结果；
+    5. 返回每轮删减/保留记录、最小告警序列、两侧规则快照摘要、期望结果与
+       可直接导出的自包含 JSON（``package``）。
+
+    全程只读取数据库，不写入 alerts / decisions / runs / receiver_logs，也不
+    触发任何转发。
+    """
+    body = payload or {}
+    try:
+        run_a_id = int(body["run_a"])
+        run_b_id = int(body["run_b"])
+        target_id = int(body["target_alert_id"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "请求体需要整数参数 run_a / run_b / target_alert_id")
+
+    conn = db.get_conn()
+    try:
+        run_a = conn.execute("SELECT * FROM runs WHERE id=?", (run_a_id,)).fetchone()
+        run_b = conn.execute("SELECT * FROM runs WHERE id=?", (run_b_id,)).fetchone()
+        if not run_a:
+            raise HTTPException(404, f"run {run_a_id} 不存在")
+        if not run_b:
+            raise HTTPException(404, f"run {run_b_id} 不存在")
+
+        da = conn.execute(
+            "SELECT * FROM decisions WHERE run_id=? AND alert_id=?",
+            (run_a_id, target_id),
+        ).fetchone()
+        db_ = conn.execute(
+            "SELECT * FROM decisions WHERE run_id=? AND alert_id=?",
+            (run_b_id, target_id),
+        ).fetchone()
+        if not da or not db_:
+            raise HTTPException(400, "目标告警在所选两个 run 中不都存在决定，无法作为复现目标")
+        if da["decision"] == db_["decision"]:
+            raise HTTPException(
+                400, "目标告警在两个 run 中的决定相同（无差异），请选择一条决定不同的目标告警"
+            )
+
+        target_row = conn.execute("SELECT * FROM alerts WHERE id=?", (target_id,)).fetchone()
+        if not target_row:
+            raise HTTPException(404, f"目标告警 {target_id} 不存在")
+        prefix_rows = conn.execute(
+            "SELECT * FROM alerts WHERE seq <= ? ORDER BY seq, id", (target_row["seq"],)
+        ).fetchall()
+        prefix = []
+        for row in prefix_rows:
+            alert = _alert_dict(row)
+            alert["ts"] = datetime.fromisoformat(alert["ts"])
+            prefix.append(alert)
+
+        snapshot_a = json.loads(run_a["rule_snapshot"])
+        snapshot_b = json.loads(run_b["rule_snapshot"])
+        expected = {
+            "a": TargetOutcome(da["decision"], da["rule_id"]),
+            "b": TargetOutcome(db_["decision"], db_["rule_id"]),
+        }
+        try:
+            result = repro_minimize(
+                prefix, snapshot_a, snapshot_b, target_id,
+                expected["a"], expected["b"],
+            )
+        except ValueError as exc:
+            raise HTTPException(409, f"差异最小化失败：{exc}")
+
+        run_a_meta = {"id": run_a["id"], "kind": run_a["kind"], "note": run_a["note"],
+                      "created_at": run_a["created_at"], "rule_snapshot": snapshot_a}
+        run_b_meta = {"id": run_b["id"], "kind": run_b["kind"], "note": run_b["note"],
+                      "created_at": run_b["created_at"], "rule_snapshot": snapshot_b}
+        target_alert = _alert_dict(target_row)
+        created_at = datetime.now().isoformat(timespec="seconds")
+        package = build_package(run_a_meta, run_b_meta, target_alert, result, created_at)
+
+        return {
+            "run_a": {"id": run_a["id"], "kind": run_a["kind"], "note": run_a["note"],
+                      "created_at": run_a["created_at"]},
+            "run_b": {"id": run_b["id"], "kind": run_b["kind"], "note": run_b["note"],
+                      "created_at": run_b["created_at"]},
+            "target": target_alert,
+            "prefix_size": len(prefix_rows),
+            "expected": {"a": result["expected_a"], "b": result["expected_b"]},
+            "minimal_alerts": result["minimal"],
+            "removed_alerts": result["removed"],
+            "rounds": result["rounds"],
+            "stats": result["stats"],
+            "package": package,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/compare/repro/verify")
+def compare_repro_verify(payload: dict = Body(...)):
+    """只读重新验证一份导出的差异复现包 JSON。
+
+    请求体即导出的 ``package`` 对象（或 ``{"package": {...}}``）。系统用包内
+    **两侧规则快照**对**最小告警序列**分别从全新冷却状态按原 seq/ts 重放，
+    核对目标的期望决定与命中规则，并校验包内容哈希。整个过程纯内存计算：
+    不读取业务数据也不写入任何表、不触发转发；因此导出的 JSON 可在任意环境
+    （甚至另一台机器、另一个数据库）上独立复验。
+    """
+    package = payload.get("package") if isinstance(payload, dict) and "package" in payload \
+        else payload
+    try:
+        result = verify_package(package)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    # 若当前数据库恰好仍有包中记录的 run（id 一致），附带只读的跨校验信息；
+    # 任何不一致都不影响包本身的自包含验证结论。
+    cross_check = None
+    conn = db.get_conn()
+    try:
+        src = (package or {}).get("source") or {}
+        ra_id = (src.get("run_a") or {}).get("id")
+        rb_id = (src.get("run_b") or {}).get("id")
+        if isinstance(ra_id, int) and isinstance(rb_id, int):
+            ra = conn.execute("SELECT id, rule_snapshot FROM runs WHERE id=?", (ra_id,)).fetchone()
+            rb = conn.execute("SELECT id, rule_snapshot FROM runs WHERE id=?", (rb_id,)).fetchone()
+            if ra and rb:
+                snap_a_now = json.loads(ra["rule_snapshot"])
+                snap_b_now = json.loads(rb["rule_snapshot"])
+                cross_check = {
+                    "run_a_present": True,
+                    "run_b_present": True,
+                    "snapshot_a_unchanged": canonical_json(snap_a_now)
+                        == canonical_json(package["rule_snapshots"]["a"]["rules"]),
+                    "snapshot_b_unchanged": canonical_json(snap_b_now)
+                        == canonical_json(package["rule_snapshots"]["b"]["rules"]),
+                }
+            else:
+                cross_check = {"run_a_present": bool(ra), "run_b_present": bool(rb)}
+    finally:
+        conn.close()
+
+    result["cross_check"] = cross_check
+    return result
+
+
+@app.get("/api/compare/repro/candidates")
+def compare_repro_candidates(run_a: int, run_b: int):
+    """列出两个 run 之间决定不同的告警（差异复现包可选目标），只读。"""
+    conn = db.get_conn()
+    try:
+        if not conn.execute("SELECT 1 FROM runs WHERE id=?", (run_a,)).fetchone():
+            raise HTTPException(404, f"run {run_a} 不存在")
+        if not conn.execute("SELECT 1 FROM runs WHERE id=?", (run_b,)).fetchone():
+            raise HTTPException(404, f"run {run_b} 不存在")
+        target_ids = _repro_targets(conn, run_a, run_b)
+        rows = conn.execute(
+            "SELECT * FROM alerts WHERE id IN (%s) ORDER BY seq, id"
+            % ",".join("?" * len(target_ids)),
+            tuple(target_ids),
+        ).fetchall() if target_ids else []
+
+        def dec(rid: int, aid: int) -> Optional[dict]:
+            r = conn.execute(
+                "SELECT decision, rule_id, rule_name FROM decisions "
+                "WHERE run_id=? AND alert_id=?", (rid, aid),
+            ).fetchone()
+            return dict(r) if r else None
+
+        items = [{
+            "alert": _alert_dict(a),
+            "a": dec(run_a, a["id"]),
+            "b": dec(run_b, a["id"]),
+        } for a in rows]
+        return {"run_a": run_a, "run_b": run_b,
+                "candidate_count": len(items), "candidates": items}
     finally:
         conn.close()
 

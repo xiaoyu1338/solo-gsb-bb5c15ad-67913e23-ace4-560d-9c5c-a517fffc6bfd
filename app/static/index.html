@@ -332,6 +332,37 @@
         </table>
       </div>
     </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>差异复现包（ddmin 最小化） <span class="badge" id="repro-badge">只读 · 不落库 · 不转发</span></h2>
+      <p class="hint">从两个 run 中选择一条<strong>决定不同</strong>的目标告警，系统以<strong>目标前缀</strong>（原 seq 不大于目标的全部告警）为候选，
+        用 <strong>ddmin</strong> 反复删块：每轮分别载入两份 run 的<strong>规则快照</strong>、<strong>清空冷却状态</strong>并按原 seq/ts 重放，
+        直到再删任一条告警都会使目标在任一侧的<strong>决定或命中规则</strong>偏离原结果。
+        输出含最小告警序列、两侧规则快照摘要、期望结果与逐轮删减/保留原因的 JSON，可随时<strong>只读重新验证</strong>；
+        整个过程<strong>不写入 alerts / decisions / runs，也不触发任何转发</strong>。</p>
+      <div class="toolbar" style="align-items:flex-end">
+        <label style="margin:0;flex:1;min-width:320px">目标告警（仅列出当前对比中决定不同的告警）
+          <select id="repro-target"><option value="">— 请选择差异告警 —</option></select>
+        </label>
+        <button class="btn primary" id="btn-repro-min">🔬 生成差异复现包</button>
+      </div>
+      <div id="repro-result"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>复现包只读重新验证</h2>
+      <p class="hint">粘贴之前导出的差异复现包 JSON（或选择导出的 <code>.json</code> 文件），系统将<strong>纯内存</strong>用包内两侧规则快照
+        对最小告警序列从零冷却重放，核对目标的期望决定与命中规则，并校验包内容哈希——无需依赖当前数据库，可在任意环境复验。</p>
+      <textarea id="repro-verify-json" rows="8" placeholder='{"package_version": 1, "kind": "difference_reproduction_package", ...}'></textarea>
+      <div class="toolbar">
+        <button class="btn primary" id="btn-repro-verify-paste">✔ 重新验证粘贴的复现包</button>
+        <button class="btn" id="btn-repro-verify-current">↻ 重新验证上方刚生成的包</button>
+        <label class="btn" style="margin:0;cursor:pointer">📂 选择导出的 .json 文件
+          <input type="file" id="repro-verify-file" accept=".json,application/json" style="display:none">
+        </label>
+      </div>
+      <div id="repro-verify-result"></div>
+    </div>
   </section>
 
   <!-- ===================== 模拟接收端 ===================== -->
